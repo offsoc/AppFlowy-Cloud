@@ -1,19 +1,17 @@
 use authentication::jwt::OptionalUserUuid;
-use collab::core::collab::DataSource;
-use collab::preclude::Collab;
 use collab_folder::CollabOrigin;
 use collab_rt_entity::{ClientCollabMessage, UpdateSync};
 use collab_rt_protocol::{Message, SyncMessage};
 use database_entity::dto::AFWorkspaceSettingsChange;
 use std::collections::HashMap;
 
-use std::ops::DerefMut;
-use std::sync::Arc;
-
 use anyhow::{anyhow, Context};
 use redis::AsyncCommands;
 use serde_json::json;
 use sqlx::{types::uuid, PgPool};
+use std::ops::DerefMut;
+use std::sync::Arc;
+use std::time::Instant;
 use tracing::instrument;
 use uuid::Uuid;
 use yrs::updates::encoder::Encode;
@@ -85,6 +83,7 @@ pub async fn create_empty_workspace(
 
   // create CollabType::Folder
   let mut txn = pg_pool.begin().await?;
+  let start = Instant::now();
   create_workspace_collab(
     user_uid,
     &workspace_id,
@@ -119,6 +118,7 @@ pub async fn create_empty_workspace(
   .await?;
   let new_workspace = AFWorkspace::try_from(new_workspace_row)?;
   txn.commit().await?;
+  collab_storage.metrics().observe_pg_tx(start.elapsed());
   Ok(new_workspace)
 }
 
@@ -138,6 +138,7 @@ pub async fn create_workspace_for_user(
 
   // add create initial collab for user
   let mut txn = pg_pool.begin().await?;
+  let start = Instant::now();
   initialize_workspace_for_user(
     user_uid,
     user_uuid,
@@ -148,6 +149,7 @@ pub async fn create_workspace_for_user(
   )
   .await?;
   txn.commit().await?;
+  collab_storage.metrics().observe_pg_tx(start.elapsed());
 
   let new_workspace = AFWorkspace::try_from(new_workspace_row)?;
   Ok(new_workspace)
@@ -749,16 +751,4 @@ pub async fn broadcast_update(
     .await?;
 
   Ok(())
-}
-
-pub fn collab_from_doc_state(doc_state: Vec<u8>, object_id: &str) -> Result<Collab, AppError> {
-  let collab = Collab::new_with_source(
-    CollabOrigin::Server,
-    object_id,
-    DataSource::DocStateV1(doc_state),
-    vec![],
-    false,
-  )
-  .map_err(|e| AppError::Unhandled(e.to_string()))?;
-  Ok(collab)
 }

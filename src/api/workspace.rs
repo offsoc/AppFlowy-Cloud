@@ -1,10 +1,11 @@
 use access_control::act::Action;
-use actix_web::web::{Bytes, Payload};
+use actix_web::web::{Bytes, Path, Payload};
 use actix_web::web::{Data, Json, PayloadConfig};
 use actix_web::{web, Scope};
 use actix_web::{HttpRequest, Result};
 use anyhow::{anyhow, Context};
 use bytes::BytesMut;
+use chrono::{DateTime, Duration, Utc};
 use collab::entity::EncodedCollab;
 use collab_entity::CollabType;
 use futures_util::future::try_join_all;
@@ -49,8 +50,9 @@ use crate::biz::workspace::ops::{
   get_reactions_on_published_view, remove_comment_on_published_view, remove_reaction_on_comment,
 };
 use crate::biz::workspace::page_view::{
-  create_page, get_page_view_collab, move_page_to_trash, restore_all_pages_from_trash,
-  restore_page_from_trash, update_page, update_page_collab_data,
+  create_page, create_space, get_page_view_collab, move_page_to_trash,
+  restore_all_pages_from_trash, restore_page_from_trash, update_page, update_page_collab_data,
+  update_space,
 };
 use crate::biz::workspace::publish::get_workspace_default_publish_view_info_meta;
 use crate::domain::compression::{
@@ -126,6 +128,10 @@ pub fn workspace_scope() -> Scope {
     .service(
       web::resource("/v1/{workspace_id}/collab/{object_id}/web-update")
         .route(web::post().to(post_web_update_handler)),
+    )
+    .service(web::resource("/{workspace_id}/space").route(web::post().to(post_space_handler)))
+    .service(
+      web::resource("/{workspace_id}/space/{view_id}").route(web::patch().to(update_space_handler)),
     )
     .service(
       web::resource("/{workspace_id}/page-view").route(web::post().to(post_page_view_handler)),
@@ -251,6 +257,22 @@ pub fn workspace_scope() -> Scope {
       .route(web::post().to(batch_get_collab_handler)),
     )
     .service(web::resource("/{workspace_id}/database").route(web::get().to(list_database_handler)))
+    .service(
+      web::resource("/{workspace_id}/database/{database_id}/row")
+        .route(web::get().to(list_database_row_id_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/database/{database_id}/fields")
+        .route(web::get().to(get_database_fields_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/database/{database_id}/row/updated")
+        .route(web::get().to(list_database_row_id_updated_handler)),
+    )
+    .service(
+      web::resource("/{workspace_id}/database/{database_id}/row/detail")
+        .route(web::get().to(list_database_row_details_handler)),
+    )
 }
 
 pub fn collab_scope() -> Scope {
@@ -606,7 +628,7 @@ async fn update_workspace_member_handler(
   Ok(AppResponse::Ok().into())
 }
 
-#[instrument(skip(state, payload), err)]
+#[instrument(skip(state, payload))]
 async fn create_collab_handler(
   user_uuid: UserUuid,
   payload: Bytes,
@@ -679,11 +701,12 @@ async fn create_collab_handler(
     .await
     .context("acquire transaction to upsert collab")
     .map_err(AppError::from)?;
+  let start = Instant::now();
 
   let action = format!("Create new collab: {}", params);
   state
     .collab_access_control_storage
-    .insert_new_collab_with_transaction(&workspace_id, &uid, params, &mut transaction, &action)
+    .upsert_new_collab_with_transaction(&workspace_id, &uid, params, &mut transaction, &action)
     .await?;
 
   transaction
@@ -691,6 +714,7 @@ async fn create_collab_handler(
     .await
     .context("fail to commit the transaction to upsert collab")
     .map_err(AppError::from)?;
+  state.metrics.collab_metrics.observe_pg_tx(start.elapsed());
 
   Ok(Json(AppResponse::Ok()))
 }
@@ -889,6 +913,7 @@ async fn post_web_update_handler(
     .await
     .map_err(AppResponseError::from)?;
   update_page_collab_data(
+    &state.pg_pool,
     state.collab_access_control_storage.clone(),
     state.metrics.appflowy_web_metrics.clone(),
     uid,
@@ -896,6 +921,51 @@ async fn post_web_update_handler(
     object_id,
     collab_type,
     &payload.doc_state,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok()))
+}
+
+async fn post_space_handler(
+  user_uuid: UserUuid,
+  path: web::Path<Uuid>,
+  payload: Json<CreateSpaceParams>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<Space>>> {
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let workspace_uuid = path.into_inner();
+  let space = create_space(
+    &state.pg_pool,
+    &state.collab_access_control_storage,
+    uid,
+    workspace_uuid,
+    &payload.space_permission,
+    &payload.name,
+    &payload.space_icon,
+    &payload.space_icon_color,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok().with_data(space)))
+}
+
+async fn update_space_handler(
+  user_uuid: UserUuid,
+  path: web::Path<(Uuid, String)>,
+  payload: Json<UpdateSpaceParams>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<Space>>> {
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let (workspace_uuid, view_id) = path.into_inner();
+  update_space(
+    &state.pg_pool,
+    &state.collab_access_control_storage,
+    uid,
+    workspace_uuid,
+    &view_id,
+    &payload.space_permission,
+    &payload.name,
+    &payload.space_icon,
+    &payload.space_icon_color,
   )
   .await?;
   Ok(Json(AppResponse::Ok()))
@@ -916,6 +986,7 @@ async fn post_page_view_handler(
     workspace_uuid,
     &payload.parent_view_id,
     &payload.layout,
+    payload.name.as_deref(),
   )
   .await?;
   Ok(Json(AppResponse::Ok().with_data(page)))
@@ -1054,7 +1125,7 @@ async fn create_collab_snapshot_handler(
     .get_user_uid(&user_uuid)
     .await
     .map_err(AppResponseError::from)?;
-  let encoded_collab_v1 = state
+  let data = state
     .collab_access_control_storage
     .get_encode_collab(
       GetCollabOrigin::User { uid },
@@ -1062,15 +1133,14 @@ async fn create_collab_snapshot_handler(
       true,
     )
     .await?
-    .encode_to_bytes()
-    .unwrap();
+    .doc_state;
 
   let meta = state
     .collab_access_control_storage
     .create_snapshot(InsertSnapshotParams {
       object_id,
       workspace_id,
-      encoded_collab_v1,
+      data,
       collab_type,
     })
     .await?;
@@ -1084,10 +1154,10 @@ async fn get_all_collab_snapshot_list_handler(
   path: web::Path<(String, String)>,
   state: Data<AppState>,
 ) -> Result<Json<AppResponse<AFSnapshotMetas>>> {
-  let (_, object_id) = path.into_inner();
+  let (workspace_id, object_id) = path.into_inner();
   let data = state
     .collab_access_control_storage
-    .get_collab_snapshot_list(&object_id)
+    .get_collab_snapshot_list(&workspace_id, &object_id)
     .await
     .map_err(AppResponseError::from)?;
   Ok(Json(AppResponse::Ok().with_data(data)))
@@ -1096,9 +1166,11 @@ async fn get_all_collab_snapshot_list_handler(
 #[instrument(level = "debug", skip(payload, state), err)]
 async fn batch_get_collab_handler(
   user_uuid: UserUuid,
+  path: Path<String>,
   state: Data<AppState>,
   payload: Json<BatchQueryCollabParams>,
 ) -> Result<Json<AppResponse<BatchQueryCollabResult>>> {
+  let workspace_id = path.into_inner();
   let uid = state
     .user_cache
     .get_user_uid(&user_uuid)
@@ -1107,7 +1179,7 @@ async fn batch_get_collab_handler(
   let result = BatchQueryCollabResult(
     state
       .collab_access_control_storage
-      .batch_get_collab(&uid, payload.into_inner().0, false)
+      .batch_get_collab(&uid, &workspace_id, payload.into_inner().0, false)
       .await,
   );
   Ok(Json(AppResponse::Ok().with_data(result)))
@@ -1191,7 +1263,11 @@ async fn add_collab_member_handler(
   state: Data<AppState>,
 ) -> Result<Json<AppResponse<()>>> {
   let payload = payload.into_inner();
-  if !state.collab_cache.is_exist(&payload.object_id).await? {
+  if !state
+    .collab_cache
+    .is_exist(&payload.workspace_id, &payload.object_id)
+    .await?
+  {
     return Err(
       AppError::RecordNotFound(format!(
         "Fail to insert collab member. The Collab with object_id {} does not exist",
@@ -1218,7 +1294,11 @@ async fn update_collab_member_handler(
 ) -> Result<Json<AppResponse<()>>> {
   let payload = payload.into_inner();
 
-  if !state.collab_cache.is_exist(&payload.object_id).await? {
+  if !state
+    .collab_cache
+    .is_exist(&payload.workspace_id, &payload.object_id)
+    .await?
+  {
     return Err(
       AppError::RecordNotFound(format!(
         "Fail to update collab member. The Collab with object_id {} does not exist",
@@ -1818,6 +1898,122 @@ async fn list_database_handler(
   )
   .await?;
   Ok(Json(AppResponse::Ok().with_data(dbs)))
+}
+
+async fn list_database_row_id_handler(
+  user_uuid: UserUuid,
+  path_param: web::Path<(String, String)>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<Vec<AFDatabaseRow>>>> {
+  let (workspace_id, db_id) = path_param.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
+
+  let db_rows = biz::collab::ops::list_database_row_ids(
+    &state.collab_access_control_storage,
+    &workspace_id,
+    &db_id,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok().with_data(db_rows)))
+}
+
+async fn get_database_fields_handler(
+  user_uuid: UserUuid,
+  path_param: web::Path<(String, String)>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<Vec<AFDatabaseField>>>> {
+  let (workspace_id, db_id) = path_param.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
+
+  let db_fields = biz::collab::ops::get_database_fields(
+    &state.collab_access_control_storage,
+    &workspace_id,
+    &db_id,
+  )
+  .await?;
+
+  Ok(Json(AppResponse::Ok().with_data(db_fields)))
+}
+
+async fn list_database_row_id_updated_handler(
+  user_uuid: UserUuid,
+  path_param: web::Path<(String, String)>,
+  state: Data<AppState>,
+  param: web::Query<ListDatabaseRowUpdatedParam>,
+) -> Result<Json<AppResponse<Vec<DatabaseRowUpdatedItem>>>> {
+  let (workspace_id, db_id) = path_param.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
+
+  // Default to 1 hour ago
+  let after: DateTime<Utc> = param
+    .after
+    .unwrap_or_else(|| Utc::now() - Duration::hours(1));
+
+  let db_rows = biz::collab::ops::list_database_row_ids_updated(
+    &state.collab_access_control_storage,
+    &state.pg_pool,
+    &workspace_id,
+    &db_id,
+    &after,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok().with_data(db_rows)))
+}
+
+async fn list_database_row_details_handler(
+  user_uuid: UserUuid,
+  path_param: web::Path<(String, String)>,
+  state: Data<AppState>,
+  param: web::Query<ListDatabaseRowDetailParam>,
+) -> Result<Json<AppResponse<Vec<AFDatabaseRowDetail>>>> {
+  let (workspace_id, db_id) = path_param.into_inner();
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let list_db_row_query = param.into_inner();
+  let row_ids = list_db_row_query.into_ids();
+
+  if let Err(e) = Uuid::parse_str(&workspace_id) {
+    return Err(
+      AppError::InvalidRequest(format!("invalid workspace id `{}`: {}", db_id, e)).into(),
+    );
+  }
+  if let Err(e) = Uuid::parse_str(&db_id) {
+    return Err(AppError::InvalidRequest(format!("invalid database id `{}`: {}", db_id, e)).into());
+  }
+
+  for id in row_ids.iter() {
+    if let Err(e) = Uuid::parse_str(id) {
+      return Err(AppError::InvalidRequest(format!("invalid row id `{}`: {}", id, e)).into());
+    }
+  }
+
+  state
+    .workspace_access_control
+    .enforce_action(&uid, &workspace_id, Action::Read)
+    .await?;
+
+  let db_rows = biz::collab::ops::list_database_row_details(
+    &state.collab_access_control_storage,
+    uid,
+    workspace_id,
+    db_id,
+    &row_ids,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok().with_data(db_rows)))
 }
 
 #[inline]

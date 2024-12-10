@@ -30,9 +30,13 @@ use shared_entity::dto::publish_dto::{PublishDatabaseData, PublishViewInfo, Publ
 use shared_entity::dto::workspace_dto::ViewLayout;
 use sqlx::PgPool;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, sync::Arc};
 
+use crate::biz::collab::folder_view::to_folder_view_icon;
+use crate::biz::collab::folder_view::to_folder_view_layout;
+use crate::biz::collab::ops::collab_from_doc_state;
+use crate::biz::collab::ops::get_latest_collab_encoded;
 use tracing::error;
 use workspace_template::gen_view_id;
 use yrs::Any;
@@ -41,12 +45,7 @@ use yrs::ArrayRef;
 use yrs::Out;
 use yrs::{Map, MapRef};
 
-use crate::biz::collab::folder_view::to_folder_view_icon;
-use crate::biz::collab::folder_view::to_folder_view_layout;
-use crate::biz::collab::ops::get_latest_collab_encoded;
-
 use super::ops::broadcast_update;
-use super::ops::collab_from_doc_state;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn duplicate_published_collab_to_workspace(
@@ -174,6 +173,7 @@ impl PublishCollabDuplicator {
     // insert all collab object accumulated
     // for self.collabs_to_insert
     let mut txn = pg_pool.begin().await?;
+    let start = Instant::now();
     for (oid, (collab_type, encoded_collab)) in collabs_to_insert.into_iter() {
       let params = CollabParams {
         object_id: oid.clone(),
@@ -183,7 +183,7 @@ impl PublishCollabDuplicator {
       };
       let action = format!("duplicate collab: {}", params);
       collab_storage
-        .insert_new_collab_with_transaction(
+        .upsert_new_collab_with_transaction(
           &dest_workspace_id,
           &duplicator_uid,
           params,
@@ -239,7 +239,7 @@ impl PublishCollabDuplicator {
       let updated_ws_w_db_collab = updated_ws_w_db_collab?;
 
       collab_storage
-        .insert_new_collab_with_transaction(
+        .upsert_new_collab_with_transaction(
           &dest_workspace_id,
           &duplicator_uid,
           CollabParams {
@@ -331,7 +331,7 @@ impl PublishCollabDuplicator {
     .await?;
 
     collab_storage
-      .insert_new_collab_with_transaction(
+      .upsert_new_collab_with_transaction(
         &dest_workspace_id,
         &duplicator_uid,
         CollabParams {
@@ -346,7 +346,10 @@ impl PublishCollabDuplicator {
       .await?;
 
     match tokio::time::timeout(Duration::from_secs(60), txn.commit()).await {
-      Ok(result) => result.map_err(AppError::from),
+      Ok(result) => {
+        collab_storage.metrics().observe_pg_tx(start.elapsed());
+        result.map_err(AppError::from)
+      },
       Err(_) => {
         error!("Timeout waiting for duplicating collabs");
         Err(AppError::RequestTimeout(

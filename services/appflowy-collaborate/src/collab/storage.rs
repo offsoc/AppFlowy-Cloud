@@ -1,19 +1,22 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+#![allow(unused_imports)]
 
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use collab::entity::EncodedCollab;
 use collab_entity::CollabType;
 use collab_rt_entity::ClientCollabMessage;
-use database::collab::cache::CollabCache;
 use itertools::{Either, Itertools};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use sqlx::Transaction;
-
+use std::collections::HashMap;
+use std::ops::DerefMut;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::timeout;
 use tracing::warn;
 use tracing::{error, instrument, trace};
+use uuid::Uuid;
 use validator::Validate;
 
 use crate::command::{CLCommandSender, CollaborationCommand};
@@ -23,17 +26,15 @@ use database::collab::{
   CollabStorageAccessControl, GetCollabOrigin,
 };
 use database_entity::dto::{
-  AFAccessLevel, AFSnapshotMeta, AFSnapshotMetas, CollabParams, InsertSnapshotParams, QueryCollab,
-  QueryCollabParams, QueryCollabResult, SnapshotData,
+  AFAccessLevel, AFSnapshotMeta, AFSnapshotMetas, CollabParams, InsertSnapshotParams,
+  PendingCollabWrite, QueryCollab, QueryCollabParams, QueryCollabResult, SnapshotData,
 };
 
 use crate::collab::access_control::CollabStorageAccessControlImpl;
-use crate::collab::queue::{StorageQueue, REDIS_PENDING_WRITE_QUEUE};
-use crate::collab::queue_redis_ops::WritePriority;
+use crate::collab::cache::CollabCache;
 use crate::collab::validator::CollabValidator;
 use crate::metrics::CollabMetrics;
 use crate::snapshot::SnapshotControl;
-use crate::state::RedisConnectionManager;
 
 pub type CollabAccessControlStorage = CollabStorageImpl<CollabStorageAccessControlImpl>;
 
@@ -45,7 +46,7 @@ pub struct CollabStorageImpl<AC> {
   access_control: AC,
   snapshot_control: SnapshotControl,
   rt_cmd_sender: CLCommandSender,
-  queue: Arc<StorageQueue>,
+  queue: Sender<PendingCollabWrite>,
 }
 
 impl<AC> CollabStorageImpl<AC>
@@ -57,15 +58,9 @@ where
     access_control: AC,
     snapshot_control: SnapshotControl,
     rt_cmd_sender: CLCommandSender,
-    redis_conn_manager: RedisConnectionManager,
-    metrics: Arc<CollabMetrics>,
   ) -> Self {
-    let queue = Arc::new(StorageQueue::new_with_metrics(
-      cache.clone(),
-      redis_conn_manager,
-      REDIS_PENDING_WRITE_QUEUE,
-      Some(metrics),
-    ));
+    let (queue, reader) = channel(1000);
+    tokio::spawn(Self::periodic_write_task(cache.clone(), reader));
     Self {
       cache,
       access_control,
@@ -73,6 +68,40 @@ where
       rt_cmd_sender,
       queue,
     }
+  }
+
+  pub fn metrics(&self) -> &CollabMetrics {
+    self.cache.metrics()
+  }
+
+  const PENDING_WRITE_BUF_CAPACITY: usize = 20;
+  async fn periodic_write_task(cache: CollabCache, mut reader: Receiver<PendingCollabWrite>) {
+    let mut buf = Vec::with_capacity(Self::PENDING_WRITE_BUF_CAPACITY);
+    loop {
+      let n = reader
+        .recv_many(&mut buf, Self::PENDING_WRITE_BUF_CAPACITY)
+        .await;
+      if n == 0 {
+        break;
+      }
+      let pending = buf.drain(..n);
+      if let Err(e) = cache.batch_insert_collab(pending.collect()).await {
+        error!("failed to persist {} collabs: {}", n, e);
+      }
+    }
+  }
+
+  async fn insert_collab(
+    &self,
+    workspace_id: &str,
+    uid: &i64,
+    params: CollabParams,
+  ) -> AppResult<()> {
+    self
+      .cache
+      .insert_encode_collab_to_disk(workspace_id, uid, params)
+      .await?;
+    Ok(())
   }
 
   async fn check_write_workspace_permission(
@@ -103,8 +132,8 @@ where
     Ok(())
   }
 
-  async fn get_encode_collab_from_editing(&self, object_id: &str) -> Option<EncodedCollab> {
-    let object_id = object_id.to_string();
+  async fn get_encode_collab_from_editing(&self, oid: &str) -> Option<EncodedCollab> {
+    let object_id = oid.to_string();
     let (ret, rx) = tokio::sync::oneshot::channel();
     let timeout_duration = Duration::from_secs(5);
 
@@ -125,15 +154,21 @@ where
     match timeout(timeout_duration, rx).await {
       Ok(Ok(Some(encode_collab))) => Some(encode_collab),
       Ok(Ok(None)) => {
-        trace!("No encode collab found in editing collab");
+        trace!("Editing collab not found: `{}`", oid);
         None
       },
       Ok(Err(err)) => {
-        error!("Failed to get encode collab from realtime server: {}", err);
+        error!(
+          "Failed to get collab from realtime server `{}`: {}",
+          oid, err
+        );
         None
       },
       Err(_) => {
-        error!("Timeout waiting for encode collab from realtime server");
+        error!(
+          "Timeout trying to read collab `{}` from realtime server",
+          oid
+        );
         None
       },
     }
@@ -178,7 +213,6 @@ where
     workspace_id: &str,
     uid: &i64,
     params: CollabParams,
-    priority: WritePriority,
   ) -> Result<(), AppError> {
     trace!(
       "Queue insert collab:{}:{}",
@@ -192,11 +226,11 @@ where
       )));
     }
 
-    self
-      .queue
-      .push(workspace_id, uid, &params, priority)
-      .await
-      .map_err(AppError::from)
+    let pending = PendingCollabWrite::new(workspace_id.into(), *uid, params);
+    if let Err(e) = self.queue.send(pending).await {
+      error!("Failed to queue insert collab doc state: {}", e);
+    }
+    Ok(())
   }
 
   async fn batch_insert_collabs(
@@ -205,18 +239,10 @@ where
     uid: &i64,
     params_list: Vec<CollabParams>,
   ) -> Result<(), AppError> {
-    let mut transaction = self.cache.pg_pool().begin().await?;
-    insert_into_af_collab_bulk_for_user(&mut transaction, uid, workspace_id, &params_list).await?;
-    transaction.commit().await?;
-
-    // update the mem cache without blocking the current task
-    let cache = self.cache.clone();
-    tokio::spawn(async move {
-      for params in params_list {
-        let _ = cache.insert_encode_collab_to_mem(&params).await;
-      }
-    });
-    Ok(())
+    self
+      .cache
+      .bulk_insert_collab(workspace_id, uid, params_list)
+      .await
   }
 }
 
@@ -225,11 +251,6 @@ impl<AC> CollabStorage for CollabStorageImpl<AC>
 where
   AC: CollabStorageAccessControl,
 {
-  fn encode_collab_redis_query_state(&self) -> (u64, u64) {
-    let state = self.cache.query_state();
-    (state.total_attempts, state.success_attempts)
-  }
-
   async fn queue_insert_or_update_collab(
     &self,
     workspace_id: &str,
@@ -238,7 +259,7 @@ where
     write_immediately: bool,
   ) -> AppResult<()> {
     params.validate()?;
-    let is_exist = self.cache.is_exist(&params.object_id).await?;
+    let is_exist = self.cache.is_exist(workspace_id, &params.object_id).await?;
     // If the collab already exists, check if the user has enough permissions to update collab
     // Otherwise, check if the user has enough permissions to create collab.
     if is_exist {
@@ -259,14 +280,11 @@ where
         .update_policy(uid, &params.object_id, AFAccessLevel::FullAccess)
         .await?;
     }
-    let priority = if write_immediately {
-      WritePriority::High
+    if write_immediately {
+      self.insert_collab(workspace_id, uid, params).await?;
     } else {
-      WritePriority::Low
-    };
-    self
-      .queue_insert_collab(workspace_id, uid, params, priority)
-      .await?;
+      self.queue_insert_collab(workspace_id, uid, params).await?;
+    }
     Ok(())
   }
 
@@ -304,7 +322,7 @@ where
 
   #[instrument(level = "trace", skip(self, params), oid = %params.oid, ty = %params.collab_type, err)]
   #[allow(clippy::blocks_in_conditions)]
-  async fn insert_new_collab_with_transaction(
+  async fn upsert_new_collab_with_transaction(
     &self,
     workspace_id: &str,
     uid: &i64,
@@ -325,11 +343,12 @@ where
       Duration::from_secs(120),
       self
         .cache
-        .insert_encode_collab_data(workspace_id, uid, &params, transaction),
+        .insert_encode_collab_data(workspace_id, uid, params, transaction),
     )
     .await
     {
-      Ok(result) => result,
+      Ok(Ok(())) => Ok(()),
+      Ok(Err(err)) => Err(err),
       Err(_) => {
         error!(
           "Timeout waiting for action completed: {}",
@@ -371,16 +390,59 @@ where
       }
     }
 
-    let encode_collab = self.cache.get_encode_collab(params.inner).await?;
+    let encode_collab = self
+      .cache
+      .get_encode_collab(&params.workspace_id, params.inner)
+      .await?;
     Ok(encode_collab)
+  }
+
+  async fn broadcast_encode_collab(
+    &self,
+    object_id: String,
+    collab_messages: Vec<ClientCollabMessage>,
+  ) -> Result<(), AppError> {
+    let (sender, recv) = tokio::sync::oneshot::channel();
+
+    self
+      .rt_cmd_sender
+      .send(CollaborationCommand::ServerSendCollabMessage {
+        object_id,
+        collab_messages,
+        ret: sender,
+      })
+      .await
+      .map_err(|err| {
+        AppError::Unhandled(format!(
+          "Failed to send encode collab command to realtime server: {}",
+          err
+        ))
+      })?;
+
+    match recv.await {
+      Ok(res) =>
+        if let Err(err) = res {
+          error!("Failed to broadcast encode collab: {}", err);
+        }
+      ,
+      // caller may have dropped the receiver
+      Err(err) => warn!("Failed to receive response from realtime server: {}", err),
+    }
+
+    Ok(())
   }
 
   async fn batch_get_collab(
     &self,
     _uid: &i64,
+    workspace_id: &str,
     queries: Vec<QueryCollab>,
     from_editing_collab: bool,
   ) -> HashMap<String, QueryCollabResult> {
+    if queries.is_empty() {
+      return HashMap::new();
+    }
+
     // Partition queries based on validation into valid queries and errors (with associated error messages).
     let (valid_queries, mut results): (Vec<_>, HashMap<_, _>) =
       queries
@@ -435,7 +497,12 @@ where
       valid_queries
     };
 
-    results.extend(self.cache.batch_get_encode_collab(cache_queries).await);
+    results.extend(
+      self
+        .cache
+        .batch_get_encode_collab(workspace_id, cache_queries)
+        .await,
+    );
     results
   }
 
@@ -444,20 +511,15 @@ where
       .access_control
       .enforce_delete(workspace_id, uid, object_id)
       .await?;
-    self.cache.delete_collab(object_id).await?;
+    self.cache.delete_collab(workspace_id, object_id).await?;
     Ok(())
   }
 
-  async fn query_collab_meta(
-    &self,
-    object_id: &str,
-    collab_type: &CollabType,
-  ) -> AppResult<CollabMetadata> {
-    self.cache.get_collab_meta(object_id, collab_type).await
-  }
-
-  async fn should_create_snapshot(&self, oid: &str) -> Result<bool, AppError> {
-    self.snapshot_control.should_create_snapshot(oid).await
+  async fn should_create_snapshot(&self, workspace_id: &str, oid: &str) -> Result<bool, AppError> {
+    self
+      .snapshot_control
+      .should_create_snapshot(workspace_id, oid)
+      .await
   }
 
   async fn create_snapshot(&self, params: InsertSnapshotParams) -> AppResult<AFSnapshotMeta> {
@@ -480,42 +542,14 @@ where
       .await
   }
 
-  async fn get_collab_snapshot_list(&self, oid: &str) -> AppResult<AFSnapshotMetas> {
-    self.snapshot_control.get_collab_snapshot_list(oid).await
-  }
-
-  async fn broadcast_encode_collab(
+  async fn get_collab_snapshot_list(
     &self,
-    object_id: String,
-    collab_messages: Vec<ClientCollabMessage>,
-  ) -> Result<(), AppError> {
-    let (sender, recv) = tokio::sync::oneshot::channel();
-
+    workspace_id: &str,
+    oid: &str,
+  ) -> AppResult<AFSnapshotMetas> {
     self
-      .rt_cmd_sender
-      .send(CollaborationCommand::ServerSendCollabMessage {
-        object_id,
-        collab_messages,
-        ret: sender,
-      })
+      .snapshot_control
+      .get_collab_snapshot_list(workspace_id, oid)
       .await
-      .map_err(|err| {
-        AppError::Unhandled(format!(
-          "Failed to send encode collab command to realtime server: {}",
-          err
-        ))
-      })?;
-
-    match recv.await {
-      Ok(res) =>
-        if let Err(err) = res {
-          error!("Failed to broadcast encode collab: {}", err);
-        }
-      ,
-      // caller may have dropped the receiver
-      Err(err) => warn!("Failed to receive response from realtime server: {}", err),
-    }
-
-    Ok(())
   }
 }

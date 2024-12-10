@@ -124,14 +124,36 @@ pub struct CollabResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Space {
+  pub view_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page {
   pub view_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSpaceParams {
+  pub space_permission: SpacePermission,
+  pub name: String,
+  pub space_icon: String,
+  pub space_icon_color: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSpaceParams {
+  pub space_permission: SpacePermission,
+  pub name: String,
+  pub space_icon: String,
+  pub space_icon_color: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatePageParams {
   pub parent_view_id: String,
   pub layout: ViewLayout,
+  pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,16 +274,63 @@ pub enum ViewLayout {
   Chat = 4,
 }
 
+impl std::fmt::Display for ViewLayout {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let s = match self {
+      ViewLayout::Document => "Document",
+      ViewLayout::Grid => "Grid",
+      ViewLayout::Board => "Board",
+      ViewLayout::Calendar => "Calendar",
+      ViewLayout::Chat => "Chat",
+    };
+    write!(f, "{}", s)
+  }
+}
+
 impl Default for ViewLayout {
   fn default() -> Self {
     Self::Document
   }
 }
 
+#[derive(Eq, PartialEq, Debug, Hash, Clone, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum SpacePermission {
+  PublicToAll = 0,
+  Private = 1,
+}
+
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct QueryWorkspaceParam {
   pub include_member_count: Option<bool>,
   pub include_role: Option<bool>,
+}
+
+#[derive(Default, Debug, Deserialize, Serialize)]
+pub struct ListDatabaseRowDetailParam {
+  // Comma separated database row ids
+  // e.g. "<uuid_1>,<uuid_2>,<uuid_3>"
+  pub ids: String,
+}
+
+#[derive(Default, Debug, Deserialize, Serialize)]
+pub struct ListDatabaseRowUpdatedParam {
+  pub after: Option<DateTime<Utc>>,
+}
+
+#[derive(Default, Debug, Deserialize, Serialize)]
+pub struct DatabaseRowUpdatedItem {
+  pub updated_at: DateTime<Utc>,
+  pub row_id: String,
+}
+
+impl ListDatabaseRowDetailParam {
+  pub fn from(ids: &[&str]) -> Self {
+    Self { ids: ids.join(",") }
+  }
+  pub fn into_ids(&self) -> Vec<&str> {
+    self.ids.split(',').collect()
+  }
 }
 
 #[derive(Default, Debug, Deserialize, Serialize)]
@@ -285,12 +354,25 @@ pub struct PublishedView {
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct AFDatabase {
   pub id: String,
-  pub name: String,
-  pub fields: Vec<AFDatabaseField>,
+  pub views: Vec<FolderViewMinimal>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct AFDatabaseRow {
+  pub id: String,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AFDatabaseRowDetail {
+  pub id: String,
+  pub cells: HashMap<String, HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AFDatabaseField {
+  pub id: String,
   pub name: String,
   pub field_type: String,
+  pub type_option: HashMap<String, serde_json::Value>,
+  pub is_primary: bool,
 }

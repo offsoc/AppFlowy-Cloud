@@ -9,7 +9,7 @@ use crate::s3_client::S3Client;
 
 use bytes::Bytes;
 use collab::core::origin::CollabOrigin;
-use collab::entity::EncodedCollab;
+use collab::entity::{EncodedCollab, EncoderVersion};
 use collab_database::workspace_database::WorkspaceDatabase;
 use collab_entity::CollabType;
 use collab_folder::{Folder, View, ViewLayout};
@@ -17,7 +17,6 @@ use collab_importer::imported_collab::ImportType;
 use collab_importer::notion::page::CollabResource;
 use collab_importer::notion::NotionImporter;
 use collab_importer::util::FileId;
-use database::collab::mem_cache::{cache_exp_secs_from_collab_type, CollabMemCache};
 use database::collab::{insert_into_af_collab_bulk_for_user, select_blob_from_af_collab};
 use database::resource_usage::{insert_blob_metadata_bulk, BulkInsertMeta};
 use database::workspace::{
@@ -33,7 +32,7 @@ use collab_importer::zip_tool::async_zip::async_unzip;
 use collab_importer::zip_tool::sync_zip::sync_unzip;
 
 use futures::stream::FuturesUnordered;
-use futures::{stream, AsyncBufRead, StreamExt};
+use futures::{stream, AsyncBufRead, AsyncReadExt, StreamExt};
 use infra::env_util::get_env_var;
 use redis::aio::ConnectionManager;
 use redis::streams::{
@@ -45,7 +44,6 @@ use redis::{AsyncCommands, RedisResult, Value};
 use database::pg_row::AFImportTask;
 use serde::{Deserialize, Serialize};
 use serde_json::from_str;
-use sqlx::types::chrono;
 use sqlx::types::chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
@@ -70,6 +68,7 @@ const GROUP_NAME: &str = "import_task_group";
 const CONSUMER_NAME: &str = "appflowy_worker";
 const MAXIMUM_CONTENT_LENGTH: &str = "3221225472";
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_import_worker(
   pg_pool: PgPool,
   mut redis_client: ConnectionManager,
@@ -78,12 +77,10 @@ pub async fn run_import_worker(
   notifier: Arc<dyn ImportNotifier>,
   stream_name: &str,
   tick_interval_secs: u64,
+  max_import_file_size: u64,
 ) -> Result<(), ImportError> {
   info!("Starting importer worker");
-  if let Err(err) = ensure_consumer_group(stream_name, GROUP_NAME, &mut redis_client)
-    .await
-    .map_err(ImportError::Internal)
-  {
+  if let Err(err) = ensure_consumer_group(stream_name, GROUP_NAME, &mut redis_client).await {
     error!("Failed to ensure consumer group: {:?}", err);
   }
 
@@ -98,6 +95,7 @@ pub async fn run_import_worker(
     CONSUMER_NAME,
     notifier.clone(),
     &metrics,
+    max_import_file_size,
   )
   .await;
 
@@ -112,6 +110,7 @@ pub async fn run_import_worker(
     notifier.clone(),
     tick_interval_secs,
     &metrics,
+    max_import_file_size,
   )
   .await?;
 
@@ -129,6 +128,7 @@ async fn process_un_acked_tasks(
   consumer_name: &str,
   notifier: Arc<dyn ImportNotifier>,
   metrics: &Option<Arc<ImportMetrics>>,
+  maximum_import_file_size: u64,
 ) {
   // when server restarts, we need to check if there are any unacknowledged tasks
   match get_un_ack_tasks(stream_name, group_name, consumer_name, redis_client).await {
@@ -142,6 +142,7 @@ async fn process_un_acked_tasks(
           pg_pool: pg_pool.clone(),
           notifier: notifier.clone(),
           metrics: metrics.clone(),
+          maximum_import_file_size,
         };
         // Ignore the error here since the consume task will handle the error
         let _ = consume_task(
@@ -170,6 +171,7 @@ async fn process_upcoming_tasks(
   notifier: Arc<dyn ImportNotifier>,
   interval_secs: u64,
   metrics: &Option<Arc<ImportMetrics>>,
+  maximum_import_file_size: u64,
 ) -> Result<(), ImportError> {
   let options = StreamReadOptions::default()
     .group(group_name, consumer_name)
@@ -179,6 +181,7 @@ async fn process_upcoming_tasks(
 
   loop {
     interval.tick().await;
+
     let tasks: StreamReadReply = match redis_client
       .xread_options(&[stream_name], &[">"], &options)
       .await
@@ -186,6 +189,17 @@ async fn process_upcoming_tasks(
       Ok(tasks) => tasks,
       Err(err) => {
         error!("Failed to read tasks from Redis stream: {:?}", err);
+
+        // Use command:
+        // docker exec -it appflowy-cloud-redis-1 redis-cli FLUSHDB to generate the error
+        // NOGROUP: No such key 'import_task_stream' or consumer group 'import_task_group' in XREADGROUP with GROUP option
+        if let Some(code) = err.code() {
+          if code == "NOGROUP" {
+            if let Err(err) = ensure_consumer_group(stream_name, GROUP_NAME, redis_client).await {
+              error!("Failed to ensure consumer group: {:?}", err);
+            }
+          }
+        }
         continue;
       },
     };
@@ -198,6 +212,7 @@ async fn process_upcoming_tasks(
           Ok(import_task) => {
             let stream_name = stream_name.to_string();
             let group_name = group_name.to_string();
+
             let context = TaskContext {
               storage_dir: storage_dir.to_path_buf(),
               redis_client: redis_client.clone(),
@@ -205,8 +220,10 @@ async fn process_upcoming_tasks(
               pg_pool: pg_pool.clone(),
               notifier: notifier.clone(),
               metrics: metrics.clone(),
+              maximum_import_file_size,
             };
-            task_handlers.push(spawn_local(async move {
+
+            let handle = spawn_local(async move {
               consume_task(
                 context,
                 import_task,
@@ -216,7 +233,8 @@ async fn process_upcoming_tasks(
               )
               .await?;
               Ok::<(), ImportError>(())
-            }));
+            });
+            task_handlers.push(handle);
           },
           Err(err) => {
             error!("Failed to deserialize task: {:?}", err);
@@ -242,6 +260,7 @@ struct TaskContext {
   pg_pool: PgPool,
   notifier: Arc<dyn ImportNotifier>,
   metrics: Option<Arc<ImportMetrics>>,
+  maximum_import_file_size: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -256,6 +275,26 @@ async fn consume_task(
     // If no created_at timestamp, proceed directly to processing
     if task.created_at.is_none() {
       return process_and_ack_task(context, import_task, stream_name, group_name, &entry_id).await;
+    }
+
+    match task.file_size {
+      None => {
+        return Err(ImportError::UpgradeToLatestVersion(format!(
+          "Missing file_size for task: {}",
+          task.task_id
+        )))
+      },
+      Some(file_size) => {
+        if file_size > context.maximum_import_file_size as i64 {
+          let file_size_in_mb = file_size as f64 / 1_048_576.0;
+          let max_size_in_mb = context.maximum_import_file_size as f64 / 1_048_576.0;
+
+          return Err(ImportError::UploadFileTooLarge {
+            file_size_in_mb,
+            max_size_in_mb,
+          });
+        }
+      },
     }
 
     // Check if the task is expired
@@ -280,8 +319,12 @@ async fn consume_task(
       if task.last_process_at.is_none() {
         task.last_process_at = Some(Utc::now().timestamp());
       }
+      process_and_ack_task(context, import_task, stream_name, group_name, &entry_id).await
     } else {
-      trace!("[Import] {} file not found, queue task", task.workspace_id);
+      info!(
+        "[Import] {} zip file not found, queue task",
+        task.workspace_id
+      );
       push_task(
         &mut context.redis_client,
         stream_name,
@@ -290,12 +333,12 @@ async fn consume_task(
         &entry_id,
       )
       .await?;
-      return Ok(());
+      Ok(())
     }
+  } else {
+    // If the task is not a notion task, proceed directly to processing
+    process_and_ack_task(context, import_task, stream_name, group_name, &entry_id).await
   }
-
-  // Process and acknowledge the task
-  process_and_ack_task(context, import_task, stream_name, group_name, &entry_id).await
 }
 
 async fn handle_expired_task(
@@ -308,7 +351,7 @@ async fn handle_expired_task(
   reason: &str,
 ) -> Result<(), ImportError> {
   info!(
-    "[Import]: {} import is expired with reason:{}, delete workspace",
+    "[Import]: {} import is expired with reason:{}",
     task.workspace_id, reason
   );
 
@@ -323,6 +366,7 @@ async fn handle_expired_task(
     ImportError::Internal(e.into())
   })?;
   remove_workspace(&import_record.workspace_id, &context.pg_pool).await;
+  info!("[Import]: deleted workspace {}", task.workspace_id);
 
   if let Err(err) = context.s3_client.delete_blob(task.s3_key.as_str()).await {
     error!(
@@ -330,7 +374,12 @@ async fn handle_expired_task(
       task.workspace_id, err
     );
   }
-  let _ = xack_task(&mut context.redis_client, stream_name, group_name, entry_id).await;
+  if let Err(err) = xack_task(&mut context.redis_client, stream_name, group_name, entry_id).await {
+    error!(
+      "[Import] failed to acknowledge task:{} error:{:?}",
+      task.workspace_id, err
+    );
+  }
   notify_user(
     task,
     Err(ImportError::UploadFileExpire),
@@ -388,7 +437,7 @@ fn is_task_expired(created_timestamp: i64, last_process_at: Option<i64>) -> Resu
 
       if elapsed.num_hours() >= hours {
         return Err(format!(
-          "[Import] task is expired: created_at: {}, last_process_at: {:?}, elapsed: {} hours",
+          "task is expired: created_at: {}, last_process_at: {:?}, elapsed: {} hours",
           created_at.format("%m/%d/%y %H:%M"),
           last_process_at,
           elapsed.num_hours()
@@ -485,10 +534,7 @@ async fn process_task(
     .parse()
     .unwrap_or(false);
 
-  info!(
-    "[Import]: Processing task: {}, retry interval: {}, streaming: {}",
-    import_task, retry_interval, streaming
-  );
+  info!("[Import]: Processing task: {}", import_task);
 
   match import_task {
     ImportTask::Notion(task) => {
@@ -836,8 +882,14 @@ async fn process_unzip_file(
   );
 
   // 1. Open the workspace folder
-  let folder_collab =
-    get_encode_collab_from_bytes(&imported.workspace_id, &CollabType::Folder, pg_pool).await?;
+  let folder_collab = get_encode_collab_from_bytes(
+    &imported.workspace_id,
+    &imported.workspace_id,
+    &CollabType::Folder,
+    pg_pool,
+    s3_client,
+  )
+  .await?;
   let mut folder = Folder::from_collab_doc_state(
     import_task.uid,
     CollabOrigin::Server,
@@ -859,8 +911,6 @@ async fn process_unzip_file(
   let mut collab_params_list = vec![];
   let mut database_view_ids_by_database_id: HashMap<String, Vec<String>> = HashMap::new();
   let mut orphan_view_ids = HashSet::new();
-  let mem_cache = CollabMemCache::new(redis_client.clone());
-  let timestamp = chrono::Utc::now().timestamp();
 
   // 3. Collect all collabs and resources
   let mut stream = imported.into_collab_stream().await;
@@ -911,8 +961,14 @@ async fn process_unzip_file(
 
   // 4. Edit workspace database collab and then encode workspace database collab
   if !database_view_ids_by_database_id.is_empty() {
-    let w_db_collab =
-      get_encode_collab_from_bytes(&w_database_id, &CollabType::WorkspaceDatabase, pg_pool).await?;
+    let w_db_collab = get_encode_collab_from_bytes(
+      &import_task.workspace_id,
+      &w_database_id,
+      &CollabType::WorkspaceDatabase,
+      pg_pool,
+      s3_client,
+    )
+    .await?;
     let mut w_database = WorkspaceDatabase::from_collab_doc_state(
       &w_database_id,
       CollabOrigin::Server,
@@ -927,15 +983,28 @@ async fn process_unzip_file(
         err
       ))
     })?;
-    // Update the workspace database cache because newly created workspace databases are cached in Redis.
-    mem_cache
-      .insert_encode_collab(
-        &w_database_id,
-        w_database_collab.clone(),
-        timestamp,
-        cache_exp_secs_from_collab_type(&CollabType::WorkspaceDatabase),
-      )
-      .await;
+
+    match w_database_collab.encode_to_bytes() {
+      Ok(bytes) => {
+        if let Err(err) = redis_client
+          .set_ex::<String, Vec<u8>, Value>(
+            encode_collab_key(&w_database_id),
+            bytes,
+            2592000, // WorkspaceDatabase => 1 month
+          )
+          .await
+        {
+          warn!(
+            "[Import] Failed to insert workspace database to Redis: {}",
+            err
+          );
+        }
+      },
+      Err(err) => warn!(
+        "[Import] Failed to encode workspace database collab payload: {}",
+        err
+      ),
+    }
 
     trace!(
       "[Import]: {} did encode workspace database collab",
@@ -966,16 +1035,21 @@ async fn process_unzip_file(
     .encode_collab_v1(|collab| CollabType::Folder.validate_require_data(collab))
     .map_err(|err| ImportError::Internal(err.into()))?;
 
-  // Update the folder cache because newly created folders are cached in Redis.
-  // Other collaboration objects do not use caching yet, so there is no need to insert them into Redis.
-  mem_cache
-    .insert_encode_collab(
-      &import_task.workspace_id,
-      folder_collab.clone(),
-      timestamp,
-      cache_exp_secs_from_collab_type(&CollabType::Folder),
-    )
-    .await;
+  match folder_collab.encode_to_bytes() {
+    Ok(bytes) => {
+      if let Err(err) = redis_client
+        .set_ex::<String, Vec<u8>, Value>(
+          encode_collab_key(&import_task.workspace_id),
+          bytes,
+          604800, // Folder => 1 week
+        )
+        .await
+      {
+        warn!("[Import] Failed to insert folder collab to Redis: {}", err);
+      }
+    },
+    Err(err) => warn!("[Import] Failed to encode folder collab payload: {}", err),
+  }
 
   let folder_collab_params = CollabParams {
     object_id: import_task.workspace_id.clone(),
@@ -1099,9 +1173,9 @@ async fn process_unzip_file(
   });
 
   if result.is_err() {
-    let _ = mem_cache.remove_encode_collab(&w_database_id).await;
-    let _ = mem_cache
-      .remove_encode_collab(&import_task.workspace_id)
+    let _: RedisResult<Value> = redis_client.del(encode_collab_key(&w_database_id)).await;
+    let _: RedisResult<Value> = redis_client
+      .del(encode_collab_key(&import_task.workspace_id))
       .await;
 
     return result;
@@ -1262,22 +1336,41 @@ async fn upload_file_to_s3(
 }
 
 async fn get_encode_collab_from_bytes(
+  workspace_id: &str,
   object_id: &str,
   collab_type: &CollabType,
   pg_pool: &PgPool,
+  s3: &Arc<dyn S3Client>,
 ) -> Result<EncodedCollab, ImportError> {
-  let bytes = select_blob_from_af_collab(pg_pool, collab_type, object_id)
-    .await
-    .map_err(|err| ImportError::Internal(err.into()))?;
-  tokio::task::spawn_blocking(move || match EncodedCollab::decode_from_bytes(&bytes) {
-    Ok(encoded_collab) => Ok(encoded_collab),
-    Err(err) => Err(ImportError::Internal(anyhow!(
-      "Failed to decode collab from bytes: {:?}",
-      err
-    ))),
-  })
-  .await
-  .map_err(|err| ImportError::Internal(err.into()))?
+  let key = collab_key(workspace_id, object_id);
+  match s3.get_blob_stream(&key).await {
+    Ok(mut resp) => {
+      let mut buf = Vec::with_capacity(resp.content_length.unwrap_or(1024) as usize);
+      resp
+        .stream
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|err| ImportError::Internal(err.into()))?;
+      let decompressed = zstd::decode_all(&*buf).map_err(|e| ImportError::Internal(e.into()))?;
+      Ok(EncodedCollab {
+        state_vector: Default::default(),
+        doc_state: decompressed.into(),
+        version: EncoderVersion::V1,
+      })
+    },
+    Err(WorkerError::RecordNotFound(_)) => {
+      // fallback to postgres
+      let bytes = select_blob_from_af_collab(pg_pool, collab_type, object_id)
+        .await
+        .map_err(|err| ImportError::Internal(err.into()))?;
+
+      Ok(
+        EncodedCollab::decode_from_bytes(&bytes)
+          .map_err(|err| ImportError::Internal(err.into()))?,
+      )
+    },
+    Err(err) => Err(err.into()),
+  }
 }
 
 /// Ensure the consumer group exists, if not, create it.
@@ -1285,7 +1378,7 @@ async fn ensure_consumer_group(
   stream_key: &str,
   group_name: &str,
   redis_client: &mut ConnectionManager,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), WorkerError> {
   let result: RedisResult<()> = redis_client
     .xgroup_create_mkstream(stream_key, group_name, "0")
     .await;
@@ -1293,11 +1386,15 @@ async fn ensure_consumer_group(
   if let Err(redis_error) = result {
     if let Some(code) = redis_error.code() {
       if code == "BUSYGROUP" {
-        return Ok(()); // Group already exists, considered as success.
+        return Ok(());
+      }
+
+      if code == "NOGROUP" {
+        return Err(WorkerError::StreamGroupNotExist(group_name.to_string()));
       }
     }
     error!("Error when creating consumer group: {:?}", redis_error);
-    return Err(redis_error.into());
+    return Err(WorkerError::Internal(redis_error.into()));
   }
 
   Ok(())
@@ -1372,10 +1469,11 @@ pub struct NotionImportTask {
 
 impl Display for NotionImportTask {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let file_size_mb = self.file_size.map(|size| size as f64 / 1_048_576.0);
     write!(
       f,
-      "NotionImportTask {{ task_id: {}, workspace_id: {}, file_size:{:?}, workspace_name: {}, user_name: {}, user_email: {} }}",
-      self.task_id, self.workspace_id, self.file_size, self.workspace_name, self.user_name, self.user_email
+      "NotionImportTask {{ task_id: {}, workspace_id: {}, file_size:{:?}MB, workspace_name: {}, user_name: {}, user_email: {} }}",
+      self.task_id, self.workspace_id, file_size_mb, self.workspace_name, self.user_name, self.user_email
     )
   }
 }
@@ -1492,4 +1590,15 @@ async fn insert_meta_from_path(
     file_type,
     file_size,
   })
+}
+
+fn collab_key(workspace_id: &str, object_id: &str) -> String {
+  format!(
+    "collabs/{}/{}/encoded_collab.v1.zstd",
+    workspace_id, object_id
+  )
+}
+
+fn encode_collab_key(object_id: &str) -> String {
+  format!("encode_collab_v0:{}", object_id)
 }

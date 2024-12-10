@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use app_error::AppError;
 use async_trait::async_trait;
+use aws_sdk_s3::primitives::ByteStream;
 use database_entity::dto::{PublishCollabItem, PublishInfo};
 use shared_entity::dto::{
   publish_dto::PublishViewMetaData,
@@ -74,7 +75,7 @@ fn check_collab_publish_name(publish_name: &str) -> Result<(), AppError> {
 
   // Only contain alphanumeric characters and hyphens
   for c in publish_name.chars() {
-    if !c.is_alphanumeric() && c != '-' {
+    if !c.is_alphanumeric() && c != '-' && c != '_' {
       return Err(AppError::PublishNameInvalidCharacter { character: c });
     }
   }
@@ -246,8 +247,9 @@ pub async fn list_collab_publish_info(
 async fn check_workspace_namespace(new_namespace: &str) -> Result<(), AppError> {
   // Must be url safe
   // Only contain alphanumeric characters and hyphens
+  // and underscores (discouraged)
   for c in new_namespace.chars() {
-    if !c.is_alphanumeric() && c != '-' {
+    if !c.is_alphanumeric() && c != '-' && c != '_' {
       return Err(AppError::CustomNamespaceInvalidCharacter { character: c });
     }
   }
@@ -467,7 +469,8 @@ impl PublishedCollabStore for PublishedCollabS3StoreWithPostgresFallback {
       let bucket_client = self.bucket_client.clone();
       let metrics = self.metrics.clone();
       let handle = tokio::spawn(async move {
-        let result = bucket_client.put_blob(&object_key, &data).await;
+        let body = ByteStream::from(data);
+        let result = bucket_client.put_blob(&object_key, body, None).await;
         if let Err(err) = result {
           debug!("Failed to publish collab to S3: {}", err);
         } else {

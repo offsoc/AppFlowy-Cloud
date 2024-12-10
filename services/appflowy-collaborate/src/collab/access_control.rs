@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use database::collab::cache::CollabCache;
 use std::sync::Arc;
 
+use crate::collab::cache::CollabCache;
 use access_control::act::Action;
 use access_control::collab::CollabAccessControl;
 use access_control::workspace::WorkspaceAccessControl;
@@ -36,7 +36,7 @@ impl CollabStorageAccessControl for CollabStorageAccessControlImpl {
     uid: &i64,
     oid: &str,
   ) -> Result<(), AppError> {
-    let collab_exists = self.cache.is_exist(oid).await?;
+    let collab_exists = self.cache.is_exist(workspace_id, oid).await?;
     if !collab_exists {
       // If the collab does not exist, we should not enforce the access control. We consider the user
       // has the permission to read the collab
@@ -54,7 +54,7 @@ impl CollabStorageAccessControl for CollabStorageAccessControlImpl {
     uid: &i64,
     oid: &str,
   ) -> Result<(), AppError> {
-    let collab_exists = self.cache.is_exist(oid).await?;
+    let collab_exists = self.cache.is_exist(workspace_id, oid).await?;
     if !collab_exists {
       // If the collab does not exist, we should not enforce the access control. we consider the user
       // has the permission to write the collab
