@@ -64,10 +64,8 @@ pub enum AppError {
   #[error("Not Logged In:{0}")]
   NotLoggedIn(String),
 
-  #[error(
-    "User:{user} does not have permissions to execute this action in workspace:{workspace_id}"
-  )]
-  NotEnoughPermissions { user: String, workspace_id: String },
+  #[error("User does not have permissions to execute this action")]
+  NotEnoughPermissions,
 
   #[error("s3 response error:{0}")]
   S3ResponseError(String),
@@ -431,6 +429,9 @@ pub enum ErrorCode {
   ApplyUpdateError = 1056,
   ActionTimeout = 1057,
   AIImageResponseLimitExceeded = 1058,
+  MailerError = 1059,
+  LicenseError = 1060,
+  AIMaxRequired = 1061,
 }
 
 impl ErrorCode {
