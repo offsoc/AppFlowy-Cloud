@@ -20,7 +20,7 @@ actix-identity = "0.6.0"
 actix-router = "0.5.2"
 actix-session = { version = "0.8", features = ["redis-rs-tls-session"] }
 actix-multipart = { version = "0.7.2", features = ["derive"] }
-openssl = { version = "0.10.62", features = ["vendored"] }
+openssl = { version = "0.10.70", features = ["vendored"] }
 zstd.workspace = true
 
 # serde
