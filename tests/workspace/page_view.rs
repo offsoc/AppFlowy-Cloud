@@ -9,8 +9,9 @@ use collab_entity::CollabType;
 use collab_folder::{CollabOrigin, Folder};
 use serde_json::{json, Value};
 use shared_entity::dto::workspace_dto::{
-  CreatePageParams, CreateSpaceParams, IconType, MovePageParams, PublishPageParams,
-  SpacePermission, UpdatePageParams, UpdateSpaceParams, ViewIcon, ViewLayout,
+  AppendBlockToPageParams, CreatePageDatabaseViewParams, CreatePageParams, CreateSpaceParams,
+  IconType, MovePageParams, PublishPageParams, SpacePermission, UpdatePageParams,
+  UpdateSpaceParams, ViewIcon, ViewLayout,
 };
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -101,6 +102,7 @@ async fn create_new_page_with_database() {
         parent_view_id: general_space.view_id.clone(),
         layout: ViewLayout::Calendar,
         name: Some("New calendar".to_string()),
+        page_data: None,
       },
     )
     .await
@@ -112,6 +114,7 @@ async fn create_new_page_with_database() {
         parent_view_id: general_space.view_id.clone(),
         layout: ViewLayout::Grid,
         name: Some("New grid".to_string()),
+        page_data: None,
       },
     )
     .await
@@ -123,6 +126,7 @@ async fn create_new_page_with_database() {
         parent_view_id: general_space.view_id.clone(),
         layout: ViewLayout::Grid,
         name: Some("New board".to_string()),
+        page_data: None,
       },
     )
     .await
@@ -176,6 +180,33 @@ async fn create_new_document_page() {
         parent_view_id: general_space.view_id.clone(),
         layout: ViewLayout::Document,
         name: Some("New document".to_string()),
+        page_data: None,
+      },
+    )
+    .await
+    .unwrap();
+  let page_with_initial_data = c
+    .create_workspace_page_view(
+      workspace_id,
+      &CreatePageParams {
+        parent_view_id: general_space.view_id.clone(),
+        layout: ViewLayout::Document,
+        name: Some("Message extracted from why is the sky blue".to_string()),
+        page_data: Some(json!({
+          "type": "page",
+          "children": [
+            {
+              "type": "paragraph",
+              "data": {
+                "delta": [
+                  {
+                    "insert": "The sky appears blue due to a phenomenon called Rayleigh scattering."
+                  }
+                ]
+              }
+            },
+          ]
+        })),
       },
     )
     .await
@@ -205,6 +236,112 @@ async fn create_new_document_page() {
   })
   .await
   .unwrap();
+  general_space
+    .children
+    .iter()
+    .find(|v| v.view_id == page_with_initial_data.view_id)
+    .unwrap();
+  c.get_collab(QueryCollabParams {
+    workspace_id: workspace_id.to_string(),
+    inner: QueryCollab {
+      object_id: page_with_initial_data.view_id,
+      collab_type: CollabType::Document,
+    },
+  })
+  .await
+  .unwrap();
+}
+
+#[tokio::test]
+async fn append_block_to_page() {
+  let (c, _user) = generate_unique_registered_user_client().await;
+  let workspaces = c.get_workspaces().await.unwrap();
+  assert_eq!(workspaces.len(), 1);
+  let workspace_id = workspaces[0].workspace_id;
+  let folder_view = c
+    .get_workspace_folder(&workspace_id.to_string(), Some(2), None)
+    .await
+    .unwrap();
+  let general_space = &folder_view
+    .children
+    .into_iter()
+    .find(|v| v.name == "General")
+    .unwrap();
+  let getting_started = general_space
+    .children
+    .iter()
+    .find(|v| v.name == "Getting started")
+    .unwrap();
+  let getting_started_view_id = &getting_started.view_id;
+  c.append_block_to_page(
+    workspace_id,
+    getting_started_view_id,
+    &AppendBlockToPageParams {
+      blocks: vec![json!({
+        "type": "paragraph",
+        "data": {
+          "delta": [
+            {
+              "insert": "The sky appears blue due to a phenomenon called Rayleigh scattering."
+            }
+          ]
+        }
+      })],
+    },
+  )
+  .await
+  .unwrap();
+}
+
+#[tokio::test]
+async fn create_new_chat_page() {
+  let (c, _user) = generate_unique_registered_user_client().await;
+  let workspaces = c.get_workspaces().await.unwrap();
+  assert_eq!(workspaces.len(), 1);
+  let workspace_id = workspaces[0].workspace_id;
+  let folder_view = c
+    .get_workspace_folder(&workspace_id.to_string(), Some(2), None)
+    .await
+    .unwrap();
+  let general_space = &folder_view
+    .children
+    .into_iter()
+    .find(|v| v.name == "General")
+    .unwrap();
+  let page = c
+    .create_workspace_page_view(
+      workspace_id,
+      &CreatePageParams {
+        parent_view_id: general_space.view_id.clone(),
+        layout: ViewLayout::Chat,
+        name: Some("New chat".to_string()),
+        page_data: None,
+      },
+    )
+    .await
+    .unwrap();
+  sleep(Duration::from_secs(1)).await;
+  let folder_view = c
+    .get_workspace_folder(&workspace_id.to_string(), Some(2), None)
+    .await
+    .unwrap();
+  let general_space = &folder_view
+    .children
+    .into_iter()
+    .find(|v| v.name == "General")
+    .unwrap();
+  general_space
+    .children
+    .iter()
+    .find(|v| v.view_id == page.view_id)
+    .unwrap();
+  assert_eq!(
+    c.get_chat_settings(&workspace_id.to_string(), &page.view_id)
+      .await
+      .unwrap()
+      .name,
+    "New chat"
+  );
 }
 
 #[tokio::test]
@@ -612,6 +749,7 @@ async fn update_page() {
           ty: IconType::Emoji,
           value: "🚀".to_string(),
         }),
+        is_locked: None,
         extra: Some(json!({"is_pinned": true})),
       },
     )
@@ -632,6 +770,7 @@ async fn update_page() {
     updated_view.extra,
     Some(json!({"is_pinned": true}).to_string())
   );
+  assert_eq!(updated_view.is_locked, None);
 }
 
 #[tokio::test]
@@ -810,4 +949,69 @@ async fn publish_page() {
     .await
     .unwrap();
   assert_eq!(published_view.children.len(), 0);
+}
+
+#[tokio::test]
+async fn create_database_page_view() {
+  let registered_user = generate_unique_registered_user().await;
+  let mut app_client = TestClient::user_with_new_device(registered_user.clone()).await;
+  let web_client = TestClient::user_with_new_device(registered_user.clone()).await;
+  let workspace_id = app_client.workspace_id().await;
+  app_client.open_workspace_collab(&workspace_id).await;
+  app_client
+    .wait_object_sync_complete(&workspace_id)
+    .await
+    .unwrap();
+  let workspace_uuid = Uuid::parse_str(&workspace_id).unwrap();
+  let folder_view = web_client
+    .api_client
+    .get_workspace_folder(&workspace_id, Some(2), None)
+    .await
+    .unwrap();
+  let general_space = &folder_view
+    .children
+    .into_iter()
+    .find(|v| v.name == "General")
+    .unwrap();
+  let todo_folder_view = general_space
+    .children
+    .iter()
+    .find(|v| v.name == "To-dos")
+    .unwrap();
+  let todo_list_view_id = todo_folder_view.view_id.as_str();
+  web_client
+    .api_client
+    .create_database_view(
+      workspace_uuid,
+      todo_list_view_id,
+      &CreatePageDatabaseViewParams {
+        layout: ViewLayout::Grid,
+        name: Some("Grid View".to_string()),
+      },
+    )
+    .await
+    .unwrap();
+  let folder = get_latest_folder(&app_client, &workspace_id).await;
+  let todo_view = folder.get_view(todo_list_view_id).unwrap();
+  let grid_view = todo_view
+    .children
+    .iter()
+    .find_map(|v| {
+      folder.get_view(&v.id).map(|view| {
+        if view.name == "Grid View" {
+          Some(view)
+        } else {
+          None
+        }
+      })
+    })
+    .flatten()
+    .unwrap();
+  let page_collab = web_client
+    .api_client
+    .get_workspace_page_view(workspace_uuid, grid_view.id.as_str())
+    .await
+    .unwrap();
+  assert_eq!(page_collab.data.row_data.len(), 5);
+  assert_eq!(page_collab.view.layout, ViewLayout::Grid);
 }

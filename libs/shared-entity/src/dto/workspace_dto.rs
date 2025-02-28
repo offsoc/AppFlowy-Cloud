@@ -134,6 +134,11 @@ pub struct EmbeddedCollabQuery {
   pub object_id: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CollabJsonResponse {
+  pub collab: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollabResponse {
   #[serde(flatten)]
@@ -179,19 +184,32 @@ pub struct CreatePageParams {
   pub parent_view_id: String,
   pub layout: ViewLayout,
   pub name: Option<String>,
+  pub page_data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdatePageParams {
   pub name: String,
   pub icon: Option<ViewIcon>,
+  pub is_locked: Option<bool>,
   pub extra: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendBlockToPageParams {
+  pub blocks: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovePageParams {
   pub new_parent_view_id: String,
   pub prev_view_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatePageDatabaseViewParams {
+  pub layout: ViewLayout,
+  pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +279,7 @@ pub struct FolderView {
   pub layout: ViewLayout,
   pub created_at: DateTime<Utc>,
   pub last_edited_time: DateTime<Utc>,
+  pub is_locked: Option<bool>,
   /// contains fields like `is_space`, and font information
   pub extra: Option<serde_json::Value>,
   pub children: Vec<FolderView>,

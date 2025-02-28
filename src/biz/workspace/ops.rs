@@ -19,15 +19,14 @@ use yrs::updates::encoder::Encode;
 use access_control::workspace::WorkspaceAccessControl;
 use app_error::AppError;
 use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
-use database::collab::upsert_collab_member_with_txn;
 use database::file::s3_client_impl::S3BucketStorage;
 use database::pg_row::AFWorkspaceMemberRow;
 
 use database::user::select_uid_from_email;
 use database::workspace::*;
 use database_entity::dto::{
-  AFAccessLevel, AFRole, AFWorkspace, AFWorkspaceInvitation, AFWorkspaceInvitationStatus,
-  AFWorkspaceSettings, GlobalComment, Reaction, WorkspaceUsage,
+  AFRole, AFWorkspace, AFWorkspaceInvitation, AFWorkspaceInvitationStatus, AFWorkspaceSettings,
+  GlobalComment, Reaction, WorkspaceUsage,
 };
 use gotrue::params::{GenerateLinkParams, GenerateLinkType};
 
@@ -538,16 +537,8 @@ pub async fn add_workspace_members_db_only(
     .context("Begin transaction to insert workspace members")?;
 
   for member in members.into_iter() {
-    let access_level = match &member.role {
-      AFRole::Owner => AFAccessLevel::FullAccess,
-      AFRole::Member => AFAccessLevel::ReadAndWrite,
-      AFRole::Guest => AFAccessLevel::ReadOnly,
-    };
-
-    let uid = select_uid_from_email(txn.deref_mut(), &member.email).await?;
     upsert_workspace_member_with_txn(&mut txn, workspace_id, &member.email, member.role.clone())
       .await?;
-    upsert_collab_member_with_txn(uid, workspace_id.to_string(), &access_level, &mut txn).await?;
   }
 
   txn
@@ -611,6 +602,14 @@ pub async fn get_workspace_member(
   workspace_id: &Uuid,
 ) -> Result<AFWorkspaceMemberRow, AppResponseError> {
   Ok(select_workspace_member(pg_pool, uid, workspace_id).await?)
+}
+
+pub async fn get_workspace_member_by_uuid(
+  member_uuid: Uuid,
+  pg_pool: &PgPool,
+  workspace_id: Uuid,
+) -> Result<AFWorkspaceMemberRow, AppResponseError> {
+  Ok(select_workspace_member_by_uuid(pg_pool, member_uuid, workspace_id).await?)
 }
 
 pub async fn update_workspace_member(
