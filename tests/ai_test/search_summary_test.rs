@@ -27,19 +27,23 @@ async fn chat_with_search_result_simple() {
     .await
     .unwrap();
   dbg!(&resp);
-  assert!(resp.score.parse::<f32>().unwrap() > 0.6);
-  assert_eq!(resp.answers.len(), 1);
-  assert_eq!(resp.metadata.get("source").unwrap(), "openai_docs");
-  assert_eq!(resp.metadata.get("timestamp").unwrap(), "2024-01-01");
+  assert_eq!(resp.summaries.len(), 1);
+  assert!(resp.summaries[0].score.parse::<f32>().unwrap() > 0.6);
+  assert_eq!(
+    resp.summaries[0].metadata.get("source").unwrap(),
+    "openai_docs"
+  );
+  assert_eq!(
+    resp.summaries[0].metadata.get("timestamp").unwrap(),
+    "2024-01-01"
+  );
 
   let resp = ai_chat
     .chat_with_documents("deepseek-r1", model_name, &docs, true)
     .await
     .unwrap();
   dbg!(&resp);
-  assert_eq!(resp.score.parse::<f32>().unwrap(), 0.0);
-  assert_eq!(resp.metadata, json!({}));
-  assert!(resp.answers.is_empty());
+  assert_eq!(resp.summaries.len(), 0);
 
   // When only_context is false, the llm knowledge base is used to answer the question.
   let resp = ai_chat
@@ -47,9 +51,9 @@ async fn chat_with_search_result_simple() {
     .await
     .unwrap();
   dbg!(&resp);
-  assert!(resp.score.parse::<f32>().unwrap() > 0.6);
-  assert_eq!(resp.metadata, json!({}));
-  assert_eq!(resp.answers.len(), 1);
+  assert_eq!(resp.summaries.len(), 1);
+  assert!(resp.summaries[0].score.parse::<f32>().unwrap() > 0.6);
+  assert_eq!(resp.summaries[0].metadata, json!({}));
 }
 
 #[tokio::test]
@@ -72,5 +76,12 @@ async fn chat_with_search_result() {
     .await
     .unwrap();
   dbg!(&resp);
-  assert_eq!(resp.answers.len(), 3);
+  assert_eq!(resp.summaries.len(), 3);
+
+  let resp = ai_chat
+    .chat_with_documents("Play Rust over time", model_name, &docs, true)
+    .await
+    .unwrap();
+  dbg!(&resp);
+  assert_eq!(resp.summaries.len(), 1);
 }
